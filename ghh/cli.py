@@ -1,4 +1,4 @@
-"""Click CLI: analyze, run, inspect, review, cleanup commands."""
+"""Click CLI: analyze, calibrate, run, inspect, review, cleanup commands."""
 
 from __future__ import annotations
 
@@ -514,6 +514,52 @@ def analyze(input_dir, output_dir, samples):
     click.echo(f"Analyzing {input_dir}...")
     toml_path = run_analyze(input_path, out_path, samples=samples)
     click.echo(f"Generated {toml_path}")
+
+
+@main.command()
+@click.argument("input_dir", type=click.Path(exists=True, file_okay=False))
+@click.option(
+    "--pattern",
+    required=True,
+    type=str,
+    help="Chessboard inner corners as COLSxROWS (OpenCV convention). "
+         "BoofCV A4 9x6 squares → 8x5.",
+)
+@click.option(
+    "--square-size",
+    required=True,
+    type=float,
+    help="Physical square size in millimetres.",
+)
+def calibrate(input_dir, pattern, square_size):
+    """Calibrate lens distortion from chessboard photos.
+
+    Runs OpenCV calibrateCamera() on a folder of checkerboard images and
+    prints lens_distortion_k1 / k2 values for book.toml (Stage 3).
+
+    Example::
+
+        ghh calibrate ~/calibration_sx200/ --pattern 8x5 --square-size 42
+    """
+    from ghh.calibrate import (
+        CalibrationError,
+        calibrate_camera,
+        format_report,
+        parse_pattern,
+    )
+
+    try:
+        pat = parse_pattern(pattern)
+    except click.BadParameter as exc:
+        raise click.UsageError(str(exc)) from exc
+
+    click.echo(f"Calibrating from {input_dir}...")
+    try:
+        result = calibrate_camera(Path(input_dir), pattern=pat, square_size=square_size)
+    except CalibrationError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    click.echo(format_report(result), nl=False)
 
 
 @main.command()
