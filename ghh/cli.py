@@ -562,12 +562,103 @@ def calibrate(input_dir, pattern, square_size):
     click.echo(format_report(result), nl=False)
 
 
-@main.command()
-@click.argument("image_path", type=click.Path(exists=True, dir_okay=False))
-@click.option("--config", type=click.Path(exists=True, dir_okay=False), default=None)
-def inspect(image_path, config):
-    """Inspect a single image with diagnostic output."""
+@main.command("inspect")
+@click.argument("image_path", type=click.Path())
+@click.option("--config", "config_path", type=click.Path(exists=True, dir_okay=False),
+              default=None, help="Path to a book.toml config file")
+@click.option("--stage", type=str, default=None,
+              help="Pipeline stage / checkpoint to load (number, name, or dir). "
+                   "Legacy alias: dewarp → deskew. With a bare stem, loads from "
+                   "--output-dir/<checkpoint>/.")
+@click.option("--output-dir", type=click.Path(exists=True, file_okay=False), default=None,
+              help="Pipeline output directory (for stem + --stage resolution)")
+@click.option("--open", "open_viewer", is_flag=True,
+              help="Open the generated image in the default viewer")
+@click.option("--max-width", type=int, default=1600,
+              help="Max width (px) to downscale for faster inspection")
+@click.option("--alpha", type=float, default=0.45, help="Overlay alpha (0.0-1.0)")
+@click.option("--ink-color", type=str, default="#00ff00",
+              help="Ink mask color (#RRGGBB or R,G,B)")
+@click.option("--geom-color", type=str, default="#ffff00",
+              help="Geometric ink highlight color")
+@click.option("--foxing-color", type=str, default="#0000ff", help="Foxing spot color")
+@click.option("--staff-color", type=str, default="#ff0000", help="Staff segment color")
+@click.option("--poly-color", type=str, default="#00ffff", help="Polynomial fit color")
+@click.option("--quad-color", type=str, default="#ff00ff", help="Page quad color")
+@click.option("--format", "output_format", type=click.Choice(["png", "jpg", "jpeg"]),
+              default="png", help="Output image format")
+@click.option("--overlay-only", is_flag=True,
+              help="Output only the overlay image (no side panel)")
+@click.option("--hide-coeffs", is_flag=True,
+              help="Hide polynomial coefficients (reduce overlay clutter)")
+@click.option("--rms-only", is_flag=True,
+              help="Show only RMS and degree per line (no coefficients)")
+@click.option("--small-font", is_flag=True, help="Use smaller font for per-line text")
+@click.option("--font-scale", type=float, default=0.45, help="Font scale for per-line text")
+@click.option("--no-line-text", is_flag=True,
+              help="Suppress per-line polynomial metadata text entirely")
+@click.option("--output", "output_path", type=click.Path(file_okay=True, dir_okay=False),
+              default=None, help="Output path for the annotated image")
+def inspect(
+    image_path,
+    config_path,
+    stage,
+    output_dir,
+    open_viewer,
+    max_width,
+    alpha,
+    ink_color,
+    geom_color,
+    foxing_color,
+    staff_color,
+    poly_color,
+    quad_color,
+    output_format,
+    overlay_only,
+    hide_coeffs,
+    rms_only,
+    small_font,
+    font_scale,
+    no_line_text,
+    output_path,
+):
+    """Inspect a single image with diagnostic overlays.
+
+    IMAGE_PATH may be an existing file, or an image stem (e.g. IMG_0045)
+    resolved via ``--stage`` and ``--output-dir``.
+
+    Generates an annotated image next to the source (or at ``--output``).
+    """
+    from ghh.inspect import InspectError, inspect_image
+
     click.echo(f"Inspecting {image_path}...")
+    try:
+        out_path = inspect_image(
+            image_path,
+            stage=stage,
+            config_path=config_path,
+            output_dir=output_dir,
+            max_width=max_width,
+            output_path=output_path,
+            open_in_viewer=open_viewer,
+            output_format=output_format,
+            overlay_only=overlay_only,
+            ink_color=ink_color,
+            geom_color=geom_color,
+            foxing_color=foxing_color,
+            staff_seg_color=staff_color,
+            poly_color=poly_color,
+            quad_color=quad_color,
+            alpha=alpha,
+            show_coeffs=(not hide_coeffs),
+            rms_only=rms_only,
+            font_scale=(0.35 if small_font else font_scale),
+            show_line_text=(not no_line_text),
+        )
+    except (InspectError, ValueError, FileNotFoundError, OSError) as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    click.echo(f"Wrote {out_path}")
 
 
 @main.command()

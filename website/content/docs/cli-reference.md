@@ -236,17 +236,75 @@ ghh flipbook ~/photos/LPA-1_output --no-pdf --cover
 
 ## ghh inspect
 
-Inspect a single image with diagnostic output.
+Inspect a single image with diagnostic overlays (ink mask, staff lines,
+polynomial fits, page quad, foxing spots) and suggested `book.toml`
+ink parameters.
 
 ```bash
 ghh inspect IMAGE_PATH [OPTIONS]
 ```
 
+`IMAGE_PATH` may be an existing file, or an image stem such as
+`IMG_0045` resolved from a pipeline checkpoint via `--stage` and
+`--output-dir`.
+
 ### Options
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `--config` | path | none | Path to a configuration file |
+| `--config` | path | none | Path to `book.toml` |
+| `--stage` | string | none | Stage number, name, or checkpoint dir (`deskew`, `8`, `08_deskewed`). Alias: `dewarp` → `deskew` |
+| `--output-dir` | path | auto | Pipeline output directory for stem resolution |
+| `--open` | flag | off | Open the result in the system viewer |
+| `--max-width` | int | 1600 | Downscale width for faster inspection |
+| `--alpha` | float | 0.45 | Overlay opacity (0–1) |
+| `--ink-color` | color | `#00ff00` | Ink mask color (`#RRGGBB` or `R,G,B`) |
+| `--geom-color` | color | `#ffff00` | Geometric ink highlight color |
+| `--foxing-color` | color | `#0000ff` | Foxing spot color |
+| `--staff-color` | color | `#ff0000` | Staff segment color |
+| `--poly-color` | color | `#00ffff` | Polynomial fit color |
+| `--quad-color` | color | `#ff00ff` | Page quad color |
+| `--format` | choice | `png` | Output format (`png`, `jpg`) |
+| `--overlay-only` | flag | off | Omit the right-hand info panel |
+| `--hide-coeffs` | flag | off | Hide polynomial coefficient lists |
+| `--rms-only` | flag | off | Show only RMS and degree per line |
+| `--small-font` | flag | off | Smaller per-line text |
+| `--font-scale` | float | 0.45 | Explicit font scale for per-line text |
+| `--no-line-text` | flag | off | Suppress all per-line metadata text |
+| `--output` | path | next to source | Output path for the annotated image |
+
+### Examples
+
+```bash
+# Inspect a file directly
+ghh inspect /path/to/IMG_0045.jpg --config /path/to/book.toml
+
+# Load a checkpoint by stem + stage from a pipeline output dir
+ghh inspect IMG_0045 --stage deskew --output-dir ~/photos/LPA-1_output
+
+# Legacy alias from PLAN.md (dewarp → deskew)
+ghh inspect IMG_0045.jpg --stage dewarp --output-dir ~/photos/LPA-1_output
+
+# Customize colors / opacity; JPEG overlay only
+ghh inspect /path/to/IMG_0045.jpg --ink-color "255,0,0" --alpha 0.4 \
+    --overlay-only --format jpg --no-line-text
+
+# Reduce per-line text clutter
+ghh inspect /path/to/IMG_0045.jpg --rms-only --small-font
+```
+
+### Visual examples
+
+With per-line polynomial metadata (coefficients and RMS):
+
+{{< img src="images/inspect_with_text.jpg" alt="Inspect overlay with per-line polynomial metadata" >}}
+
+Clean overlay without per-line text:
+
+{{< img src="images/inspect_no_text.jpg" alt="Inspect overlay without per-line text" >}}
+
+A JSON sidecar is written next to the image with current vs suggested
+`staff_color_hue` / `staff_color_range` values for tuning `book.toml`.
 
 ## ghh review
 

@@ -104,6 +104,24 @@ ghh publish /path/to/output /var/www/mybook
 ghh cleanup /path/to/output
 ```
 
+### Inspect workflow
+
+Use `ghh inspect` to visually diagnose ink detection, staff-line fits, and page quad detection. Pass a file path, or an image stem plus `--stage` / `--output-dir` to load a pipeline checkpoint.
+
+```bash
+# Quick inspect with defaults
+ghh inspect /path/to/IMG_0045.jpg
+
+# Load from a checkpoint (stem + stage)
+ghh inspect IMG_0045 --stage deskew --output-dir /path/to/photos_output
+
+# Tune overlay appearance and suppress per-line metadata
+ghh inspect /path/to/IMG_0045.jpg --ink-color "#ff0000" --alpha 0.4 --overlay-only --no-line-text
+
+# Show only RMS residuals (compact)
+ghh inspect /path/to/IMG_0045.jpg --rms-only --small-font
+```
+
 ### Compare & Publish
 
 After processing, `ghh compare` generates an interactive HTML viewer that lets you flip through every image across all pipeline stages. It's automatically created at the end of every `ghh run`.
