@@ -2,10 +2,13 @@
 
 Provides background color estimation and post-geometry content trimming.
 Used by Stage 5 (perspective), Stage 8 (deskew), and Stage 9 (dewarp).
+Also provides illumination flattening for shadow-tolerant binarization
+(ghh#89); the enhancement stage will wire it behind config knobs.
 """
 
 from __future__ import annotations
 
+import cv2
 import numpy as np
 
 
@@ -104,3 +107,59 @@ def trim_to_content(
 
     padded[margin : margin + cropped.shape[0], margin : margin + cropped.shape[1]] = cropped
     return padded, int(x0 - margin), int(y0 - margin)
+
+
+def flatten_illumination(
+    gray: np.ndarray,
+    blur_frac: float = 0.10,
+) -> np.ndarray:
+    """Remove slow illumination gradients, keep ink/text (shadow subtract).
+
+    Perspec-style flattening (see
+    https://adriansieber.com/announcing-perspec-1-0/): a heavily blurred
+    copy holds only the illumination (text averages away), subtracting it
+    keeps high frequencies (ink) and drops low frequencies (soft shadows,
+    room gradients). The result is re-centered on mid-gray so a global
+    Otsu threshold splits ink from background.
+
+    Args:
+        gray: 2D uint8 grayscale image.
+        blur_frac: blur kernel size as a fraction of the smaller image
+            dimension. ~0.10 averages text away while keeping page
+            shading; larger values tolerate broader shadows but cost
+            more time on big images (downscale first for previews).
+            Must satisfy 0 < blur_frac < 1.
+
+    Returns:
+        uint8 image with background near 128 and ink darker.
+
+    Grayscale/BW paths only: never apply this to color images fed to
+    color-aware ink detection — it would destroy the red staff ink
+    signal those stages rely on.
+    """
+    if gray.ndim != 2:
+        raise ValueError(f"expected 2D grayscale image, got shape {gray.shape}")
+    if not 0.0 < blur_frac < 1.0:
+        raise ValueError(f"blur_frac must be in (0, 1), got {blur_frac}")
+    h, w = gray.shape[:2]
+    k = max(3, int(min(h, w) * blur_frac))
+    if k % 2 == 0:
+        k += 1
+    blur = cv2.GaussianBlur(gray, (k, k), 0)
+    flat = gray.astype(np.float32) - blur.astype(np.float32) + 128.0
+    return np.clip(flat, 0, 255).astype(np.uint8)
+
+
+def threshold_otsu_flattened(
+    gray: np.ndarray,
+    blur_frac: float = 0.10,
+) -> np.ndarray:
+    """Binarize via illumination flattening + global Otsu (ghh#89).
+
+    Ink ends up black (0), background white (255). Prefer this over a
+    raw global Otsu whenever lighting may be uneven; on evenly lit
+    pages the result agrees with plain Otsu.
+    """
+    flat = flatten_illumination(gray, blur_frac)
+    _, binary = cv2.threshold(flat, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return binary

@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
+import cv2
 import numpy as np
 import pytest
 
 from ghh.utils.image_utils import estimate_background, trim_to_content
-
 
 # ---------------------------------------------------------------------------
 # TestEstimateBackground
@@ -133,3 +133,73 @@ class TestTrimToContent:
         assert result.shape == (50, 50, 3)
         assert x_off == 25
         assert y_off == 25
+
+
+def _gradient_page(h=400, w=400):
+    """Synthetic page: diagonal light gradient + dark text bars everywhere."""
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    bg = 40 + 170 * (xx / w + yy / h) / 2  # 40 (dark corner) .. 210 (bright)
+    gray = bg.astype(np.uint8)
+    truth = np.zeros((h, w), dtype=bool)
+    for y in range(30, h - 20, 40):  # text bars span the full width
+        gray[y:y + 8, 10:w - 10] = 20
+        truth[y:y + 8, 10:w - 10] = True
+    # A text-free strip in the dark corner to measure false ink.
+    dark_strip = np.zeros((h, w), dtype=bool)
+    dark_strip[:, :8] = True
+    return gray, truth, dark_strip
+
+
+class TestFlattenIllumination:
+    """flatten_illumination / threshold_otsu_flattened (ghh#89)."""
+
+    def test_recovers_text_under_gradient(self):
+        from ghh.utils.image_utils import threshold_otsu_flattened
+
+        gray, truth, dark_strip = _gradient_page()
+        _, raw = cv2.threshold(
+            gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU,
+        )
+        flat = threshold_otsu_flattened(gray)
+        raw_ink = raw == 0
+        flat_ink = flat == 0
+
+        # Dark-zone background must not read as ink ...
+        assert float(raw_ink[dark_strip].mean()) > float(flat_ink[dark_strip].mean())
+        # ... and real text must survive everywhere, dark corner included.
+        assert float(flat_ink[truth].mean()) > 0.95
+        # Overall: raw Otsu buys its recall by calling dark background ink;
+        # flattening must produce strictly fewer false positives.
+        raw_fp = float((raw_ink & ~truth).mean())
+        flat_fp = float((flat_ink & ~truth).mean())
+        assert flat_fp < raw_fp
+
+    def test_output_is_binary_ink_black(self):
+        from ghh.utils.image_utils import threshold_otsu_flattened
+
+        gray, _, _ = _gradient_page()
+        flat = threshold_otsu_flattened(gray)
+        assert flat.dtype == np.uint8
+        assert set(np.unique(flat).tolist()) <= {0, 255}
+
+    def test_clean_page_mostly_unchanged(self):
+        """Do-no-harm: on evenly lit pages flattening is ~a no-op."""
+        from ghh.utils.image_utils import threshold_otsu_flattened
+
+        gray = np.full((200, 200), 200, dtype=np.uint8)
+        gray[40:48, 20:180] = 20
+        gray[100:108, 20:180] = 20
+        _, raw = cv2.threshold(
+            gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU,
+        )
+        flat = threshold_otsu_flattened(gray)
+        agreement = float((raw == flat).mean())
+        assert agreement > 0.98
+
+    def test_blur_frac_validated(self):
+        from ghh.utils.image_utils import flatten_illumination
+
+        gray, _, _ = _gradient_page()
+        for bad in (0.0, -0.1, 1.0, 2.0):
+            with pytest.raises(ValueError, match="blur_frac"):
+                flatten_illumination(gray, blur_frac=bad)
