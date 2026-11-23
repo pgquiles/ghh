@@ -353,6 +353,140 @@ class TestInvalidateFrom:
         _invalidate_from([stage], state, tmp_path)  # should not raise
 
 
+class TestStaleUpstreamInvalidation:
+    """_prepend_stale_upstream(): --stages subsets must notice upstream
+    config changes (e.g. new lens coefficients with --stages 4-6)."""
+
+    def _lens_cfg(self, tmp_path, k1):
+        return Config(
+            input_dir=tmp_path,
+            lens_distortion_k1=k1,
+            lens_distortion_k2=0.0,
+        )
+
+    def _setup_selection(self, tmp_path):
+        from ghh.stages import get_stages
+        from ghh.stages.page_detect import PageDetectStage
+
+        cfg = self._lens_cfg(tmp_path, -0.14)
+        state = PipelineState(tmp_path)
+        # Realistic resume: stages 0-2 ran with the current config.
+        for upstream in get_stages([0, 1, 2]):
+            d = tmp_path / upstream.checkpoint_name
+            d.mkdir()
+            (d / "IMG_0001.png").write_bytes(b"fake")
+            state.set_stage_hash(upstream.name, upstream.config_hash(cfg))
+        upstream_dir = tmp_path / "03_lens_corrected"
+        upstream_dir.mkdir()
+        (upstream_dir / "IMG_0001.png").write_bytes(b"fake")
+        downstream_dir = tmp_path / "04_page_detected"
+        downstream_dir.mkdir()
+
+        state.set_stage_hash("lens_correct", "old_hash")
+        state.mark_image_done("page_detect", "IMG_0001")
+        return PageDetectStage(), state, downstream_dir
+
+    def _names(self, stages):
+        return [s.name for s in stages]
+
+    def test_upstream_change_prepends_upstream(self, tmp_path):
+        from ghh.cli import _prepend_stale_upstream
+
+        page, state, _ = self._setup_selection(tmp_path)
+        # Stored hash differs from hash of the new coefficients.
+        extended = _prepend_stale_upstream(
+            [page], self._lens_cfg(tmp_path, -0.14), state, tmp_path,
+        )
+        assert self._names(extended) == ["lens_correct", "page_detect"]
+
+    def test_upstream_unchanged_leaves_selection_alone(self, tmp_path):
+        from ghh.cli import _prepend_stale_upstream
+        from ghh.stages.lens_correct import LensCorrectStage
+
+        page, state, _ = self._setup_selection(tmp_path)
+        cfg = self._lens_cfg(tmp_path, -0.14)
+        state.set_stage_hash("lens_correct", LensCorrectStage().config_hash(cfg))
+        assert _prepend_stale_upstream([page], cfg, state, tmp_path) == [page]
+
+    def test_missing_never_ran_upstream_is_prepended(self, tmp_path):
+        """Newly activated stage (no checkpoint, no stored hash) is included."""
+        import shutil
+
+        from ghh.cli import _prepend_stale_upstream
+        page, state, _ = self._setup_selection(tmp_path)
+        shutil.rmtree(tmp_path / "03_lens_corrected")
+        state.invalidate_stage("lens_correct")
+        extended = _prepend_stale_upstream(
+            [page], self._lens_cfg(tmp_path, -0.14), state, tmp_path,
+        )
+        assert self._names(extended) == ["lens_correct", "page_detect"]
+
+    def test_fresh_selection_is_untouched(self, tmp_path):
+        """First runs never prepend: nothing can be stale yet."""
+        from ghh.cli import _prepend_stale_upstream
+
+        page, state, _ = self._setup_selection(tmp_path)
+        import shutil
+        # Selection has no results yet; upstream changed meanwhile.
+        shutil.rmtree(tmp_path / "04_page_detected")
+        extended = _prepend_stale_upstream(
+            [page], self._lens_cfg(tmp_path, -0.14), state, tmp_path,
+        )
+        assert extended == [page]
+
+    def test_skipped_upstream_is_ignored(self, tmp_path):
+        from ghh.cli import _prepend_stale_upstream
+
+        page, state, _ = self._setup_selection(tmp_path)
+        # k1=k2=0 → lens_correct should_skip → no invalidation.
+        extended = _prepend_stale_upstream(
+            [page], self._lens_cfg(tmp_path, 0.0), state, tmp_path,
+        )
+        assert extended == [page]
+
+
+class TestStagesSubsetUpstreamE2E:
+    """End-to-end: a --stages subset re-runs after an upstream config change.
+
+    Regression test for silently reusing stale inputs: run stages 0-4 on
+    a synthetic image, change an upstream (stage 3) coefficient, then run
+    only stage 4. Stage 3 must be pulled back in and both must re-process.
+    """
+
+    def test_subset_reruns_after_upstream_config_change(self, tmp_path):
+        import cv2
+        import numpy as np
+
+        from ghh.cli import _run_stage_list
+        from ghh.config import Config
+        from ghh.stages import get_stages
+
+        input_dir = tmp_path / "in"
+        input_dir.mkdir()
+        img = np.full((300, 400, 3), 200, dtype=np.uint8)
+        cv2.rectangle(img, (50, 50), (350, 250), (30, 30, 30), 3)
+        cv2.imwrite(str(input_dir / "IMG_0001.png"), img)
+
+        out = tmp_path / "out"
+        cfg = Config(input_dir=input_dir, output_dir=out)
+        state = PipelineState(out)
+        total, failed = _run_stage_list(
+            get_stages([0, 1, 2, 3, 4]), input_dir, out, cfg, state, 1, True,
+        )
+        assert failed == 0
+        assert total > 0
+
+        cfg2 = Config(
+            input_dir=input_dir, output_dir=out, lens_distortion_k1=-0.5,
+        )
+        total2, failed2 = _run_stage_list(
+            get_stages([4]), input_dir, out, cfg2, state, 1, True,
+        )
+        assert failed2 == 0
+        # Stage 3 (prepended) and stage 4 both re-processed the image.
+        assert total2 == 2
+
+
 # ---------------------------------------------------------------------------
 # TestCheckDiskSpace
 # ---------------------------------------------------------------------------

@@ -277,7 +277,7 @@ def inspect_image(
             font_scale=font_scale,
         )
 
-    quad = find_page_quad(img_small)
+    quad, quad_source = _resolve_quad(img_small, img, resolved, output_dir)
     if quad is not None:
         quad_int = np.round(quad).astype(np.int32)
         for i in range(4):
@@ -307,6 +307,7 @@ def inspect_image(
     sidecar.write_text(json.dumps({
         "source": str(resolved),
         "stage": stage_label or stage,
+        "quad_source": quad_source,
         "suggestions": suggestions,
         "staff_lines": len(staff_lines),
         "ink_pixels": int(np.count_nonzero(color_mask)),
@@ -329,6 +330,71 @@ def inspect_image(
 # ---------------------------------------------------------------------------
 # Internals
 # ---------------------------------------------------------------------------
+
+def _resolve_quad(
+    img_small: np.ndarray,
+    img_full: np.ndarray,
+    resolved: Path,
+    output_dir: str | Path | None,
+) -> tuple[np.ndarray | None, str]:
+    """Return (quad, source) for the overlay, preferring stored Stage 4 data.
+
+    The fresh ``find_page_quad`` detection re-detects on the inspected
+    image, which is not necessarily what Stage 4 recorded (and Stage 5
+    consumed). When the inspected image matches the checkpoint image the
+    sidecar quad was detected on, draw the stored quad scaled to the
+    display size (``source="stored"``); otherwise fall back to fresh
+    detection (``source="fresh"``) or ``"none"``.
+    """
+    h0, w0 = img_full.shape[:2]
+    stored, dims = _stored_page_quad(resolved, output_dir)
+    if stored is not None and dims == (h0, w0):
+        scale = img_small.shape[1] / float(w0) if w0 else 1.0
+        logger.info("Using stored Stage 4 quad from sidecar")
+        return stored * scale, "stored"
+    quad = find_page_quad(img_small)
+    return quad, ("fresh" if quad is not None else "none")
+
+
+def _stored_page_quad(
+    resolved: Path,
+    output_dir: str | Path | None,
+) -> tuple[np.ndarray | None, tuple[int, int] | None]:
+    """Load the Stage 4 quad sidecar for *resolved*, if any.
+
+    Returns (quad_xy, (ckpt_h, ckpt_w)) in checkpoint-image pixels, or
+    (None, None) when no sidecar (or its checkpoint image) is found. The
+    caller must check the dims match the inspected image: coordinates are
+    only valid on the image they were detected on.
+    """
+    resolved = Path(resolved)
+    stem = resolved.stem
+    candidates: list[Path] = []
+    if resolved.parent.name == "04_page_detected":
+        candidates.append(resolved.parent / f"{stem}.json")
+    if output_dir is not None:
+        candidates.append(Path(output_dir) / "04_page_detected" / f"{stem}.json")
+    for base in (resolved.parent, resolved.parent.parent):
+        candidates.append(base / "04_page_detected" / f"{stem}.json")
+    for sc in candidates:
+        if not sc.is_file():
+            continue
+        try:
+            quad = json.loads(sc.read_text()).get("quad_corners")
+        except (OSError, ValueError):
+            continue
+        if not quad:
+            continue
+        for ext in (".png", ".jpg", ".jpeg"):
+            ckpt_img = sc.parent / f"{stem}{ext}"
+            if ckpt_img.is_file():
+                ckpt = cv2.imread(str(ckpt_img), cv2.IMREAD_GRAYSCALE)
+                if ckpt is not None:
+                    h, w = ckpt.shape[:2]
+                    return np.asarray(quad, dtype=np.float32), (h, w)
+        # Sidecar without its image: coordinates unverifiable, keep looking.
+    return None, None
+
 
 def _guess_output_dir(ref: Path) -> Path | None:
     """Best-effort discovery of a pipeline ``*_output`` directory."""

@@ -165,3 +165,40 @@ class TestInspectImage:
         data = json.loads(res.with_suffix(".json").read_text())
         assert data["stage"] == "07_staff_extract"
         assert "IMG_0001.png" in data["source"]
+
+    def test_uses_stored_page_quad(self, tmp_path: Path):
+        out = tmp_path / "book_output"
+        ckpt = out / "04_page_detected"
+        ckpt.mkdir(parents=True)
+        img = ckpt / "IMG_0042.png"
+        make_synthetic_staff_image(img, w=800, h=600)
+        quad = [[10.0, 20.0], [790.0, 20.0], [790.0, 590.0], [10.0, 590.0]]
+        (ckpt / "IMG_0042.json").write_text(json.dumps({
+            "stage": "page_detect",
+            "quad_corners": quad,
+        }))
+
+        res = inspect_image(
+            "IMG_0042",
+            stage="4",
+            output_dir=out,
+            max_width=600,
+            output_path=tmp_path / "stored_quad.png",
+        )
+        assert res.exists()
+        data = json.loads(res.with_suffix(".json").read_text())
+        assert data["quad_source"] == "stored"
+
+    def test_falls_back_without_sidecar(self, tmp_path: Path):
+        img_path = tmp_path / "sample.png"
+        make_synthetic_staff_image(img_path)
+
+        res = inspect_image(
+            image_path=img_path,
+            max_width=600,
+            output_path=tmp_path / "fresh_quad.png",
+            open_in_viewer=False,
+        )
+        assert res.exists()
+        data = json.loads(res.with_suffix(".json").read_text())
+        assert data["quad_source"] in ("fresh", "none")

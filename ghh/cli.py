@@ -193,6 +193,8 @@ def _run_stage_list(
     ``stage.config_keys``).  If the hash differs from the stored one,
     the stage and all downstream stages in the list are invalidated --
     their cached results are cleared so they re-run from scratch.
+    ``--stages`` subsets additionally prepend unselected upstream stages
+    whose outputs are stale or missing (see ``_prepend_stale_upstream``).
     """
     import click
     from tqdm import tqdm
@@ -204,6 +206,13 @@ def _run_stage_list(
     total_failed = 0
 
     invalidated_from: int | None = None
+
+    # Upstream stages outside a --stages subset still feed it: prepend
+    # any whose outputs are stale so the selection re-runs on fresh input.
+    stages = _prepend_stale_upstream(
+        stages, cfg, state, effective_output,
+        fallback_dir=output_path if branch_dir else None,
+    )
 
     for idx, stage in enumerate(stages):
         if stage.should_skip(cfg):
@@ -264,6 +273,65 @@ def _run_stage_list(
         )
 
     return total_processed, total_failed
+
+
+def _prepend_stale_upstream(
+    stages: list,
+    cfg,
+    state,
+    output_dir: Path,
+    fallback_dir: Path | None = None,
+) -> list:
+    """Prepend unselected upstream stages whose outputs are stale.
+
+    ``--stages`` subsets skip the config-hash check for stages outside the
+    selection, so an upstream output change (e.g. new lens coefficients in
+    Stage 3 while running ``--stages 4-6``) would silently reuse stale
+    inputs. Any lower-numbered, non-skipped stage is prepended when its
+    checkpoint shows a changed config, or when it never ran at all (e.g.
+    newly activated by the config change) while the selection already has
+    results. The normal in-loop invalidation then cascades through the
+    extended list, so every selected stage re-runs from fresh inputs.
+    """
+    from ghh.stages import STAGE_BY_NUMBER, get_stages
+
+    if not stages:
+        return stages
+    # Only a resume can go stale: first runs have nothing to invalidate.
+    if not any((output_dir / s.checkpoint_name).is_dir() for s in stages):
+        return stages
+    first_num = min(s.number for s in stages)
+    upstream_nums = sorted(n for n in STAGE_BY_NUMBER if n < first_num)
+    if not upstream_nums:
+        return stages
+    prepend: list = []
+    for upstream in get_stages(upstream_nums):
+        if upstream.should_skip(cfg):
+            continue
+        # Presence in either dir: branch runs read common checkpoints
+        # via the fallback root (see _find_previous_checkpoint).
+        present = _has_checkpoint(output_dir, upstream.checkpoint_name)
+        if not present and fallback_dir is not None:
+            present = _has_checkpoint(fallback_dir, upstream.checkpoint_name)
+        current_hash = upstream.config_hash(cfg)
+        if present and state.is_stage_invalidated(upstream.name, current_hash):
+            prepend.append(upstream)  # changed config, stale output on disk
+        elif not present and state.get_stage_hash(upstream.name) is None:
+            prepend.append(upstream)  # never ran; selection was built without it
+    if prepend:
+        names = ", ".join(f"{s.number} ({s.name})" for s in prepend)
+        logger.info(
+            "Upstream stages changed or missing, prepending to selection: %s",
+            names,
+        )
+        return prepend + list(stages)
+    return stages
+
+
+def _has_checkpoint(output_dir: Path, checkpoint_name: str) -> bool:
+    """True when a checkpoint dir exists and holds files."""
+    candidate = output_dir / checkpoint_name
+    return candidate.is_dir() and any(candidate.iterdir())
 
 
 def _invalidate_from(
