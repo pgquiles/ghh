@@ -933,3 +933,108 @@ class TestBorderRefinementIntegration:
             rh, rw = result.shape[:2]
             assert rw < img.shape[1], \
                 "Output should be narrower than input (large artifact excluded)"
+
+
+def _make_wrinkled_page_on_background(
+    w=600, h=400, border=100, wave_amp=12, wave_len=90,
+):
+    """Bright page with sine-perturbed edges on a dark background.
+
+    Returns (photo, true_corners) with corners in TL, TR, BR, BL order.
+    """
+    canvas = np.full(
+        (h + 2 * border, w + 2 * border, 3), (40, 30, 25), dtype=np.uint8,
+    )
+    xs = np.arange(border, border + w)
+    top = border + (wave_amp * np.sin(2 * np.pi * xs / wave_len)).astype(int)
+    bot = border + h + (wave_amp * np.sin(2 * np.pi * xs / wave_len + 1.0)).astype(int)
+    ys = np.arange(border, border + h)
+    left = border + (wave_amp * np.sin(2 * np.pi * ys / wave_len + 2.0)).astype(int)
+    right = border + w + (wave_amp * np.sin(2 * np.pi * ys / wave_len + 3.0)).astype(int)
+    poly = (
+        [(int(x), int(y)) for x, y in zip(xs, top)]
+        + [(int(x), int(y)) for x, y in zip(right[::-1], ys[::-1])]
+        + [(int(x), int(y)) for x, y in zip(xs[::-1], bot[::-1])]
+        + [(int(x), int(y)) for x, y in zip(left, ys)]
+    )
+    cv2.fillPoly(canvas, [np.array(poly)], (235, 230, 220))
+    true_corners = np.array(
+        [[border, border], [border + w, border],
+         [border + w, border + h], [border, border + h]],
+        dtype=np.float32,
+    )
+    return canvas, true_corners
+
+
+def _corner_error(found, expected):
+    """Max pairwise distance after ordering found TL, TR, BR, BL."""
+    from ghh.utils.geometry import order_corners
+
+    ordered = order_corners(np.asarray(found, dtype=np.float32))
+    return float(np.abs(ordered - expected).max())
+
+
+class TestWatershedPageDetect:
+    """Watershed + subpixel-corner page detection (ghh#88)."""
+
+    def test_finds_straight_page(self):
+        from ghh.stages.page_detect import _try_watershed
+
+        page = make_music_page(width=600, height=400)
+        photo = make_page_on_background(page, border=100)
+        gray = cv2.cvtColor(photo, cv2.COLOR_BGR2GRAY)
+        cfg = Config(input_dir=Path("/tmp"))
+
+        quad = _try_watershed(gray, cfg)
+
+        assert quad is not None
+        assert quad.shape == (4, 2)
+        expected = np.array(
+            [[100, 100], [700, 100], [700, 500], [100, 500]],
+            dtype=np.float32,
+        )
+        assert _corner_error(quad, expected) < 30
+
+    def test_handles_wrinkled_outline(self):
+        from ghh.stages.page_detect import _try_watershed
+
+        photo, expected = _make_wrinkled_page_on_background()
+        gray = cv2.cvtColor(photo, cv2.COLOR_BGR2GRAY)
+        cfg = Config(input_dir=Path("/tmp"))
+
+        quad = _try_watershed(gray, cfg)
+
+        assert quad is not None
+        assert _corner_error(quad, expected) < 40
+
+    def test_rejects_uniform_image(self):
+        from ghh.stages.page_detect import _try_watershed
+
+        gray = np.full((600, 800), 200, dtype=np.uint8)
+        cfg = Config(input_dir=Path("/tmp"))
+
+        assert _try_watershed(gray, cfg) is None
+
+    def test_rejects_tiny_page(self):
+        from ghh.stages.page_detect import _try_watershed
+
+        page = make_music_page(width=200, height=150)
+        photo = make_page_on_background(page, border=300)
+        gray = cv2.cvtColor(photo, cv2.COLOR_BGR2GRAY)
+        cfg = Config(input_dir=Path("/tmp"))
+
+        assert _try_watershed(gray, cfg) is None
+
+    def test_method_in_dispatch(self):
+        from ghh.stages.page_detect import _find_page_quad
+
+        page = make_music_page(width=600, height=400)
+        photo = make_page_on_background(page, border=100)
+        gray = cv2.cvtColor(photo, cv2.COLOR_BGR2GRAY)
+        cfg = Config(input_dir=Path("/tmp"), page_detect_method="watershed")
+
+        quad, name = _find_page_quad(gray, cfg)
+
+        assert name == "watershed"
+        assert quad is not None
+        assert quad.shape == (4, 2)

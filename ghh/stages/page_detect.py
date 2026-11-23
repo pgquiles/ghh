@@ -15,7 +15,8 @@ Detection uses a cascading fallback chain:
 2. Inverted Otsu (dark page on light background)
 3. Canny edge detection + contour finding
 4. Adaptive threshold (handles uneven lighting)
-5. Full-image fallback (entire image treated as the page)
+5. Watershed segmentation + subpixel corners (soft/wrinkled edges)
+6. Full-image fallback (entire image treated as the page)
 
 After finding the largest contour, it is refined to a 4-point quad via
 ``approxPolyDP`` with escalating epsilon, or ``minAreaRect`` as a last
@@ -396,6 +397,7 @@ def _find_page_quad(
             "otsu_inverted": lambda: _try_otsu(gray, cfg, invert=True),
             "canny": lambda: _try_canny(gray, cfg),
             "adaptive": lambda: _try_adaptive(gray, cfg),
+            "watershed": lambda: _try_watershed(gray, cfg),
         }
         fn = dispatch.get(cfg.page_detect_method)
         if fn is not None:
@@ -409,6 +411,7 @@ def _find_page_quad(
         ("otsu_inverted", lambda: _try_otsu(gray, cfg, invert=True)),
         ("canny", lambda: _try_canny(gray, cfg)),
         ("adaptive", lambda: _try_adaptive(gray, cfg)),
+        ("watershed", lambda: _try_watershed(gray, cfg)),
     ]:
         quad = fn()
         if quad is not None:
@@ -455,6 +458,80 @@ def _try_adaptive(gray: np.ndarray, cfg: Config) -> np.ndarray | None:
     return _largest_quad(binary, gray.shape, cfg)
 
 
+# Longest side (px) for the watershed downscale. Keeps the segment step
+# fast on 12 MP photos while page geometry survives.
+_WATERSHED_DOWNSCALE_LONGEST = 512
+
+# Sobel elevation below this range means "no edges" (uniform image).
+_WATERSHED_MIN_ELEVATION_RANGE = 1.0
+
+
+def _try_watershed(gray: np.ndarray, cfg: Config) -> np.ndarray | None:
+    """Watershed segmentation → outline → subpixel corners (ghh#88).
+
+    Segment-then-corner alternative to the contour/line geometry paths,
+    after Perspec's approach (see
+    https://adriansieber.com/announcing-perspec-1-0/): grayscale is
+    downscaled and blurred, a Sobel elevation map is flooded from a
+    center ("page") and a rim ("background") seed, the mask is closed,
+    and the outline quad corners are refined with subpixel accuracy
+    (cornerSubPix — a Förstner-style step that avoids Harris's inward
+    bias). Area validation reuses :func:`_largest_quad`, so uniform
+    images and tiny pages fall through to the next cascade method.
+    """
+    h, w = gray.shape[:2]
+    scale = min(1.0, _WATERSHED_DOWNSCALE_LONGEST / max(h, w))
+    if scale < 1.0:
+        small = cv2.resize(
+            gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA,
+        )
+    else:
+        small = gray
+    sh, sw = small.shape[:2]
+
+    blurred = cv2.GaussianBlur(small, (5, 5), 0)
+    gx = cv2.Sobel(blurred, cv2.CV_64F, 1, 0, ksize=3)
+    gy = cv2.Sobel(blurred, cv2.CV_64F, 0, 1, ksize=3)
+    elevation = np.sqrt(gx * gx + gy * gy)
+    if float(elevation.max() - elevation.min()) < _WATERSHED_MIN_ELEVATION_RANGE:
+        return None
+
+    elev_n = cv2.normalize(elevation, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    elev_bgr = cv2.cvtColor(elev_n, cv2.COLOR_GRAY2BGR)
+
+    rim = max(2, int(min(sh, sw) * 0.01))
+    markers = np.zeros((sh, sw), dtype=np.int32)
+    markers[:rim, :] = 1
+    markers[-rim:, :] = 1
+    markers[:, :rim] = 1
+    markers[:, -rim:] = 1
+    # Small central seed: a big seed hard-labels background as page when
+    # the page is small or off-center, and no area gate can catch that.
+    markers[sh // 3 : 2 * sh // 3, sw // 3 : 2 * sw // 3] = 2
+
+    cv2.watershed(elev_bgr, markers)
+    mask = np.uint8(markers == 2) * 255
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+    if _mask_boundary_support(mask, elevation) < 0.5:
+        # Outline runs through flat background: arbitrary flood fill,
+        # not a page edge (e.g. seed missed a small/off-center page).
+        return None
+
+    quad_small = _largest_quad(mask, small.shape, cfg)
+    if quad_small is None:
+        return None
+
+    criteria = (
+        cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 40, 0.001,
+    )
+    corners = quad_small.reshape(-1, 1, 2).astype(np.float32)
+    cv2.cornerSubPix(small, corners, (5, 5), (-1, -1), criteria)
+    return (corners.reshape(4, 2) / scale).astype(np.float32)
+
+
 def _full_image_quad(h: int, w: int) -> np.ndarray:
     """Return a quad covering the entire image (last resort).
 
@@ -465,6 +542,33 @@ def _full_image_quad(h: int, w: int) -> np.ndarray:
         [[0, 0], [w, 0], [w, h], [0, h]],
         dtype=np.float32,
     )
+
+
+# ---------------------------------------------------------------------------
+# Watershed mask validation
+# ---------------------------------------------------------------------------
+
+def _mask_boundary_support(mask: np.ndarray, elevation: np.ndarray) -> float:
+    """Fraction of the mask outline sitting on real elevation ridges.
+
+    A watershed flood constrained by page edges runs along strong
+    gradients; a flood that spilled across flat background has an
+    outline in near-zero elevation. Returns the fraction of outline
+    pixels above 15% of the peak elevation (0.0 when no outline found).
+    """
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not contours:
+        return 0.0
+    outline = max(contours, key=cv2.contourArea).reshape(-1, 2)
+    if len(outline) == 0:
+        return 0.0
+    peak = float(elevation.max())
+    if peak <= 0:
+        return 0.0
+    step = max(1, len(outline) // 200)
+    sample = outline[::step]
+    hits = sum(1 for x, y in sample if elevation[y, x] > 0.15 * peak)
+    return hits / len(sample)
 
 
 # ---------------------------------------------------------------------------
