@@ -53,6 +53,99 @@ def is_non_content(img: np.ndarray) -> bool:
 # ORB matching helpers
 # ---------------------------------------------------------------------------
 
+def _match_homography(
+    kp_a, des_a, kp_b, des_b, cfg: Config,
+) -> tuple[np.ndarray | None, float, int]:
+    """ORB match + Lowe ratio + RANSAC homography from A to B.
+
+    Returns (H, inlier_ratio, good_count); H is None (with inlier_ratio
+    0.0) when matching fails or yields too few good matches.
+    """
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING)
+    try:
+        raw_matches = bf.knnMatch(des_a, des_b, k=2)
+    except cv2.error:
+        return None, 0.0, 0
+
+    # Lowe's ratio test
+    good = []
+    for m_pair in raw_matches:
+        if len(m_pair) == 2:
+            m, n = m_pair
+            if m.distance < cfg.stitch_ratio_threshold * n.distance:
+                good.append(m)
+
+    good_count = len(good)
+    if good_count < cfg.stitch_min_matches:
+        return None, 0.0, good_count
+
+    pts_a = np.float32([kp_a[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+    pts_b = np.float32([kp_b[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+
+    H, mask = cv2.findHomography(pts_a, pts_b, cv2.RANSAC, 5.0)
+    if H is None or mask is None:
+        return None, 0.0, good_count
+
+    inlier_ratio = float(mask.sum()) / len(mask)
+    return H, inlier_ratio, good_count
+
+
+def _estimate_unique_ink_frac(
+    img_loser: np.ndarray,
+    img_keeper: np.ndarray,
+    cfg: Config,
+) -> float | None:
+    """Fraction of the loser's ink the keeper never saw (ghh#93).
+
+    Warps the keeper's footprint into the loser's frame and counts loser
+    ink pixels outside it (plus a small tolerance margin). Measuring
+    against the footprint — not keeper ink — makes the check immune to
+    in-overlap differences (blur, exposure, slight misregistration):
+    only content outside the keeper's view counts. Returns None when
+    the pair cannot be aligned — callers must treat that as "no
+    evidence" and keep both images rather than risk content loss.
+    """
+    gray_loser = (
+        cv2.cvtColor(img_loser, cv2.COLOR_BGR2GRAY)
+        if img_loser.ndim == 3 else img_loser
+    )
+    gray_keeper = (
+        cv2.cvtColor(img_keeper, cv2.COLOR_BGR2GRAY)
+        if img_keeper.ndim == 3 else img_keeper
+    )
+
+    orb = cv2.ORB_create(nfeatures=2000)
+    kp_loser, des_loser = orb.detectAndCompute(gray_loser, None)
+    kp_keeper, des_keeper = orb.detectAndCompute(gray_keeper, None)
+    if des_loser is None or des_keeper is None:
+        return None
+    H, _, _ = _match_homography(
+        kp_loser, des_loser, kp_keeper, des_keeper, cfg,
+    )
+    if H is None:
+        return None
+    try:
+        keeper_to_loser = np.linalg.inv(H)
+    except np.linalg.LinAlgError:
+        return None
+
+    _, ink_loser = cv2.threshold(
+        gray_loser, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU,
+    )
+    h, w = gray_loser.shape[:2]
+    footprint = np.full(gray_keeper.shape[:2], 255, dtype=np.uint8)
+    seen = cv2.warpPerspective(
+        footprint, keeper_to_loser, (w, h), flags=cv2.INTER_NEAREST,
+    )
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    seen = cv2.dilate(seen, kernel)
+    unique = np.logical_and(ink_loser > 0, seen == 0)
+    total = int((ink_loser > 0).sum())
+    if total == 0:
+        return 0.0
+    return float(unique.sum()) / total
+
+
 def _match_pair(
     img_a: np.ndarray,
     img_b: np.ndarray,
@@ -75,32 +168,11 @@ def _match_pair(
     if des_a is None or des_b is None or len(des_a) < 2 or len(des_b) < 2:
         return 0, 0.0, 0.0
 
-    bf = cv2.BFMatcher(cv2.NORM_HAMMING)
-    try:
-        raw_matches = bf.knnMatch(des_a, des_b, k=2)
-    except cv2.error:
-        return 0, 0.0, 0.0
-
-    # Lowe's ratio test
-    good = []
-    for m_pair in raw_matches:
-        if len(m_pair) == 2:
-            m, n = m_pair
-            if m.distance < cfg.stitch_ratio_threshold * n.distance:
-                good.append(m)
-
-    good_count = len(good)
-    if good_count < cfg.stitch_min_matches:
-        return good_count, 0.0, 0.0
-
-    pts_a = np.float32([kp_a[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
-    pts_b = np.float32([kp_b[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
-
-    H, mask = cv2.findHomography(pts_a, pts_b, cv2.RANSAC, 5.0)
-    if H is None or mask is None:
-        return good_count, 0.0, 0.0
-
-    inlier_ratio = float(mask.sum()) / len(mask)
+    H, inlier_ratio, good_count = _match_homography(
+        kp_a, des_a, kp_b, des_b, cfg,
+    )
+    if H is None:
+        return good_count, inlier_ratio, 0.0
 
     # Estimate overlap area
     h_a, w_a = img_a.shape[:2]
@@ -301,18 +373,28 @@ def deduplicate_retakes(
                 focus_j = compute_focus(group_images[names[j]])
 
                 if focus_i >= focus_j:
-                    keep_set.discard(names[j])
-                    discarded[names[j]] = (
-                        f"retake of {names[i]} "
-                        f"(overlap={overlap_frac:.1%}, focus={focus_j:.1f} vs {focus_i:.1f})"
-                    )
+                    keeper, loser = names[i], names[j]
                 else:
-                    keep_set.discard(names[i])
-                    discarded[names[i]] = (
-                        f"retake of {names[j]} "
-                        f"(overlap={overlap_frac:.1%}, focus={focus_i:.1f} vs {focus_j:.1f})"
+                    keeper, loser = names[j], names[i]
+                unique = _estimate_unique_ink_frac(
+                    group_images[loser], group_images[keeper], cfg,
+                )
+                if unique is not None and unique < cfg.retake_unique_ink_frac:
+                    keep_set.discard(loser)
+                    discarded[loser] = (
+                        f"retake of {keeper} "
+                        f"(overlap={overlap_frac:.1%}, focus={focus_j:.1f} vs {focus_i:.1f}, "
+                        f"unique_ink={unique:.1%})"
                     )
-                    break
+                    if keeper != names[i]:
+                        break
+                else:
+                    logger.info(
+                        "Keeping %s alongside %s: %.1f%% unique ink "
+                        "(complementary partials, not a retake)",
+                        loser, keeper,
+                        100.0 if unique is None else unique * 100.0,
+                    )
 
     kept = {n: group_images[n] for n in names if n in keep_set}
     return kept, discarded

@@ -67,6 +67,29 @@ def _make_overlapping_pair(
     return img_a, img_b
 
 
+def _make_complementary_pair(
+    overlap_frac: float = 0.9,
+    h: int = 400,
+    w: int = 600,
+    seed: int = 7,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Two high-overlap windows with unique ink outside the shared zone.
+
+    Models IMG_0232/IMG_0233: near-duplicate framing where each shot still
+    holds content the other misses (dark bars in the outer strips).
+    """
+    overlap_px = int(w * overlap_frac)
+    total_w = 2 * w - overlap_px
+
+    canvas = _make_textured_page(h, total_w, seed=seed)
+    canvas[50:90, 5:25] = (20, 20, 20)
+    canvas[200:240, total_w - 25:total_w - 5] = (20, 20, 20)
+    img_a = canvas[:, :w].copy()
+    img_b = canvas[:, (w - overlap_px):].copy()
+
+    return img_a, img_b
+
+
 def _make_dark_cover(h: int = 400, w: int = 600) -> np.ndarray:
     """Simulate a book cover: mostly dark/brown uniform pixels."""
     img = np.full((h, w, 3), (30, 25, 20), dtype=np.uint8)
@@ -286,6 +309,44 @@ class TestRetakeDedup:
 
         assert len(kept) == 2
         assert len(discarded) == 0
+
+    def test_complementary_partials_are_both_kept(self):
+        """High-overlap pair with unique ink on each side is not a retake.
+
+        Regression test for LPA01 IMG_0232/IMG_0233 (overlap 90.6% yet
+        complementary): the loser must survive when it holds content the
+        keeper misses, so the stitcher gets its chance.
+        """
+        from ghh.utils.stitch import deduplicate_retakes
+
+        img_a, img_b = _make_complementary_pair(overlap_frac=0.9)
+        group_images = {"IMG_0001": img_a, "IMG_0002": img_b}
+        cfg = Config(
+            input_dir=Path("/tmp"),
+            retake_overlap_threshold=0.8,
+        )
+
+        kept, discarded = deduplicate_retakes(group_images, cfg)
+
+        assert len(kept) == 2
+        assert len(discarded) == 0
+
+    def test_true_retakes_still_discarded(self):
+        """Identical framing with no unique ink keeps a single image."""
+        from ghh.utils.stitch import deduplicate_retakes
+
+        sharp = _make_textured_page(seed=1)
+        blurry = cv2.GaussianBlur(sharp, (15, 15), 5)
+        group_images = {"IMG_0001": sharp.copy(), "IMG_0002": blurry.copy()}
+        cfg = Config(
+            input_dir=Path("/tmp"),
+            retake_overlap_threshold=0.8,
+        )
+
+        kept, discarded = deduplicate_retakes(group_images, cfg)
+
+        assert len(kept) == 1
+        assert len(discarded) == 1
 
 
 # ---------------------------------------------------------------------------

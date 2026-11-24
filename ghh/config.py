@@ -87,6 +87,9 @@ class Config:
     stitch_min_overlap_frac: float = 0.15
     stitch_inlier_ratio: float = 0.5
     retake_overlap_threshold: float = 0.9
+    # Discard a high-overlap "retake" only if the loser adds less than
+    # this fraction of unique ink (ghh#93: complementary partials stay).
+    retake_unique_ink_frac: float = 0.05
 
     # Page overrides (manual stitch control)
     stitch_groups: list[list[str]] | None = None
@@ -304,6 +307,7 @@ class Config:
         _map_if_present(kwargs, stitch, "min_overlap_frac", "stitch_min_overlap_frac")
         _map_if_present(kwargs, stitch, "inlier_ratio", "stitch_inlier_ratio")
         _map_if_present(kwargs, stitch, "retake_overlap_threshold", "retake_overlap_threshold")
+        _map_if_present(kwargs, stitch, "retake_unique_ink_frac", "retake_unique_ink_frac")
 
         # [page_overrides] section
         overrides_section = toml_data.get("page_overrides", {})
